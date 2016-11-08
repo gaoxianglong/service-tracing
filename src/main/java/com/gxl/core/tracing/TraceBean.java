@@ -19,7 +19,6 @@ public class TraceBean {
 	private Integer resultState;
 	/* 根调用标记 */
 	private boolean isRootSpan = false;
-	
 	private String isSampling;
 
 	public String getIsSampling() {

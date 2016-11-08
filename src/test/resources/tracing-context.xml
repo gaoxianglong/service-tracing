@@ -61,4 +61,10 @@
 		<!-- 保存DruidDataSource的监控记录到日志中 -->
 		<property name="timeBetweenLogStatsMillis" value="${um.timeBetweenLogStatsMillis}" />
 	</bean>
+	<bean id="zkConnection" class="com.gxl.zk.ZKConnectionManager"
+		init-method="init">
+		<property name="address" value="${address}" />
+		<property name="zk_session_timeout" value="${zk_session_timeout}" />
+		<property name="samplingRate_path" value="${samplingRate_path}" />
+	</bean>
 </beans>

@@ -25,11 +25,12 @@ import redis.clients.jedis.JedisCluster;
 @Activate(group = { Constants.PROVIDER, Constants.CONSUMER })
 public class TraceFilter implements Filter {
 	private TraceHandler traceHandler;
-	private boolean isConsumer, isProvider;
-	private String host, serviceName, methodName;
-	private Integer port;
 	private static TraceDao traceDao;
 	public static JedisCluster jedisCluster;
+	/* 采样率计数器 */
+	private Integer samplingCounter = 1;
+	/* 采样率 */
+	public static Integer samplingNum;
 	private static Logger logger = LoggerFactory.getLogger(TraceFilter.class);
 
 	public TraceFilter() {
@@ -48,33 +49,37 @@ public class TraceFilter implements Filter {
 
 	@Override
 	public Result invoke(Invoker<?> invoker, Invocation invocation) throws RpcException {
+		logger.info("hashCode-->" + this.hashCode() + "\tthreadID-->" + Thread.currentThread().getId());
 		final long BEFORE_TIME = System.currentTimeMillis();
 		RpcInvocation rpcInvocation = (RpcInvocation) invocation;
-		/* 获取当前RPC请求的上下文信息 */
+		/* 获取当前Span过程的状态记录信息 */
 		RpcContext context = RpcContext.getContext();
-		if (null != context) {
-			isConsumer = context.isConsumerSide();
-			isProvider = context.isProviderSide();
-			host = context.getLocalHost();
-			port = context.getLocalPort();
-			serviceName = context.getUrl().getServiceInterface();
-			methodName = context.getMethodName();
-		}
-		/* 从ThreadLocal中获取记录一次请求的调用链上下文信息 */
+		final boolean IS_CONSUMER = context.isConsumerSide();
+		final boolean IS_PROVIDER = context.isProviderSide();
+		final String HOST = context.getLocalHost();
+		final Integer PORT = context.getLocalPort();
+		final String SERVICE_NAME = context.getUrl().getServiceInterface();
+		String METHOD_NAME = context.getMethodName();
+		/* 从ThreadLocal中获取当前线程的Trace上下文信息 */
 		TraceBean traceBean = traceHandler.getTrace().get();
 		/* 判断是服务提供方还是调用方 */
-		if (isConsumer) {
-			/* 如果ThreadLocal中不包含当前线程的调用链上下文信息则意味着是根调用,需要创建TraceID */
+		if (IS_CONSUMER) {
+			/* 如果ThreadLocal中不包含当前线程的Trace上下文信息则意味着是根调用,需要创建TraceID */
 			if (null == traceBean) {
-				int samplingNum = Integer.parseInt(jedisCluster.get("samplingNum"));
-				if (0 >= samplingNum) {
-					rpcInvocation.setAttachment("isSampling", "N");
-					logger.info("serviceName-->" + serviceName + "不需要采样");
-					return invoker.invoke(rpcInvocation);
+				synchronized (samplingCounter) {
+					if (samplingCounter != samplingNum) {
+						logger.info("serviceName-->" + SERVICE_NAME + "不需要采样");
+						rpcInvocation.setAttachment("isSampling", "N");
+						/* 根据请求数递增采样率计数器 */
+						samplingCounter++;
+						return invoker.invoke(rpcInvocation);
+					}
+					/* 重置采样率计数器 */
+					samplingCounter = 1;
+					logger.info("serviceName-->" + SERVICE_NAME + "需要采样");
+					rpcInvocation.setAttachment("isSampling", "Y");
+					traceBean = traceHandler.createTracer(HOST, PORT, SERVICE_NAME, METHOD_NAME);
 				}
-				jedisCluster.set("samplingNum", String.valueOf(--samplingNum));
-				rpcInvocation.setAttachment("isSampling", "Y");
-				traceBean = traceHandler.createTracer(host, port, serviceName, methodName);
 			} else {
 				/* 检测是否需要采样 */
 				if (!consumerIsSampling(traceBean, rpcInvocation))
@@ -86,16 +91,16 @@ public class TraceFilter implements Filter {
 				 * 一次请求的Trace通过TraceID串联起来,服务之间的依赖关系、调用顺序
 				 * 通过parentSpanID和SpanID保证,
 				 * 服务提供方才会将Trace上下文信息存储在当前线程的ThreadLocal中,SpanID每次都是递增1的,
-				 * 而parentSpanID则是取SpanID递增前的值,这样就可以明确当前Span的父ID明确具体的服务依赖关系
+				 * 而parentSpanID则是取它的上一个Span过程的SpanID,这样就可以明确服务调用的调用顺序和依赖关系
 				 */
 				traceBean = traceHandler.createTracer(TRACE_ID, traceHandler.getSpanID(TRACE_ID, jedisCluster),
-						traceBean.getSpanId(), host, port, serviceName, methodName);
+						traceBean.getSpanId(), HOST, PORT, SERVICE_NAME, METHOD_NAME);
 			}
 			traceBean.setEventType(0);
-			/* 设置需要传递给服务提供方的调用链上下文信息 */
+			/* 将Trace上下文信息设置到Invocation中 */
 			setAnnotation(rpcInvocation, traceBean);
 		}
-		if (isProvider) {
+		if (IS_PROVIDER) {
 			/* 检测是否需要采样 */
 			if (!providerIsSampling(rpcInvocation))
 				return invoker.invoke(rpcInvocation);
@@ -103,8 +108,8 @@ public class TraceFilter implements Filter {
 			final Long TRACE_ID = Long.parseLong(rpcInvocation.getAttachment("traceID"));
 			final Integer SPAN_ID = Integer.parseInt(rpcInvocation.getAttachment("spanID"));
 			final Integer PARENT_SPAN_ID = Integer.parseInt(rpcInvocation.getAttachment("parentSpanID"));
-			traceBean = traceHandler.createTracer(TRACE_ID, SPAN_ID, PARENT_SPAN_ID, host, port, serviceName,
-					methodName);
+			traceBean = traceHandler.createTracer(TRACE_ID, SPAN_ID, PARENT_SPAN_ID, HOST, PORT, SERVICE_NAME,
+					METHOD_NAME);
 			traceBean.setEventType(1);
 		}
 		/* 前置数据收集 */
@@ -137,6 +142,7 @@ public class TraceFilter implements Filter {
 			traceDao.insertClientSendTime(trace, time);
 		} else {
 			traceDao.insertServerReceiveTime(trace, time);
+			/* 将Trace上下文信息设置在ThreadLocal中 */
 			traceHandler.getTrace().set(trace);
 		}
 	}
